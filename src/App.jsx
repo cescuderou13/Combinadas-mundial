@@ -172,86 +172,116 @@ function computeState(results) {
 }
 const effR = (r, t) => r[t] + (HOSTS.has(t) ? HOST_BOOST : 0);
 
-// candidatos de mercado por partido
-function candidates(m, f) {
-  const c = [];
-  const add = (label, p, emoji) => { if (p > 0.02 && p < 0.985) c.push({ label, p, od: fairOdds(p), emoji }); };
-  add(`${es(f.home)} o empate`, m.pHome + m.pDraw, "🛡️");
-  add(`Empate o ${es(f.away)}`, m.pAway + m.pDraw, "🛡️");
-  add(`${es(f.home)} o ${es(f.away)}`, m.pHome + m.pAway, "⚔️");
-  add(`Gana ${es(f.home)}`, m.pHome, "✅");
-  add(`Gana ${es(f.away)}`, m.pAway, "✅");
-  add("Empate", m.pDraw, "🤝");
-  add("Más de 2.5 goles", m.pOver25, "🥅");
-  add("Menos de 2.5 goles", m.pUnder25, "🧱");
-  add("Ambos marcan", m.pBTTS, "⚽");
-  add("No ambos marcan", 1 - m.pBTTS, "🚫");
-  add("Más de 9.5 córners", m.pCornersOver, "🚩");
-  add("Menos de 9.5 córners", 1 - m.pCornersOver, "🚩");
-  add("Más de 3.5 tarjetas", m.pCardsOver, "🟨");
-  add("Menos de 3.5 tarjetas", 1 - m.pCardsOver, "🟨");
-  add("Más de 7.5 remates al arco", m.pSotOver, "🎯");
-  return c;
-}
-// una opción por familia de mercado (estilo bet builder: la cara más probable de cada tipo)
-function familyPicks(m, f) {
-  const mk = (label, p, emoji, fam) => {
-    const pp = clamp(p, 0.02, 0.985);
-    return { label, p: pp, od: fairOdds(pp), emoji, fam, mid: f.id, home: f.home, away: f.away, date: f.date };
+// elige la línea + lado más probable dentro de una banda útil, apuntando a ~target
+function bestLine(mu, lines, target) {
+  let best = null;
+  const consider = (line, side, p) => {
+    if (p < 0.55 || p > 0.9) return;
+    const score = -Math.abs(p - target);
+    if (!best || score > best.score) best = { line, side, p, score };
   };
-  const out = [];
-  const favHome = m.pHome >= m.pAway;
-  const favP = favHome ? m.pHome : m.pAway;
-  const favName = favHome ? es(f.home) : es(f.away);
-  out.push(favP >= 0.45
-    ? mk(`Gana ${favName}`, favP, "✅", "res")
-    : mk(favHome ? `${es(f.home)} o empate` : `Empate o ${es(f.away)}`, favP + m.pDraw, "🛡️", "res"));
-  out.push(m.pOver25 >= 0.5 ? mk("+2.5 goles", m.pOver25, "🥅", "goals") : mk("−2.5 goles", m.pUnder25, "🧱", "goals"));
-  out.push(m.pBTTS >= 0.5 ? mk("Ambos marcan", m.pBTTS, "⚽", "btts") : mk("No ambos marcan", 1 - m.pBTTS, "🚫", "btts"));
-  out.push(m.pCornersOver >= 0.5 ? mk("+9.5 córners", m.pCornersOver, "🚩", "cor") : mk("−9.5 córners", 1 - m.pCornersOver, "🚩", "cor"));
-  out.push(m.pCardsOver >= 0.5 ? mk("+3.5 tarjetas", m.pCardsOver, "🟨", "card") : mk("−3.5 tarjetas", 1 - m.pCardsOver, "🟨", "card"));
-  out.push(m.pSotOver >= 0.5 ? mk("+7.5 remates al arco", m.pSotOver, "🎯", "sot") : mk("−7.5 remates al arco", 1 - m.pSotOver, "🎯", "sot"));
-  return out;
+  for (const L of lines) { const po = poisOver(L, mu); consider(L, "over", po); consider(L, "under", 1 - po); }
+  if (!best) { // fallback: la prob más alta por debajo de 0.92
+    for (const L of lines) {
+      const po = poisOver(L, mu);
+      [["over", po], ["under", 1 - po]].forEach(([s, p]) => { if (p <= 0.92 && (!best || p > best.p)) best = { line: L, side: s, p }; });
+    }
+  }
+  return best;
 }
-// bet builder de un solo partido hasta llegar al tramo
-function sameGameCombo(m, f, tier) {
-  const fams = familyPicks(m, f).sort((a, b) => b.p - a.p);
+// una selección por familia, con la LÍNEA más probable de cada partido (bet builder)
+function famSel(m, f) {
+  const sel = [];
+  const push = (id, fam, emoji, label, p) => {
+    const pp = clamp(p, 0.02, 0.985);
+    sel.push({ id, fam, emoji, label, p: pp, fair: fairOdds(pp), mid: f.id, home: f.home, away: f.away, date: f.date });
+  };
+  const favHome = m.pHome >= m.pAway;
+  const favName = favHome ? es(f.home) : es(f.away);
+  const favP = favHome ? m.pHome : m.pAway;
+  const favLam = favHome ? m.lh : m.la;
+
+  // resultado: gana favorito si hay favorito claro, si no doble oportunidad
+  if (favP >= 0.5) push("res", "res", "✅", `Gana ${favName}`, favP);
+  else push("res", "res", "🛡️", favHome ? `${es(f.home)} o empate` : `Empate o ${es(f.away)}`, favP + m.pDraw);
+
+  // goles totales (línea dinámica)
+  const g = bestLine(m.lt, [1.5, 2.5, 3.5], 0.66);
+  push("goals", "goals", g.side === "over" ? "🥅" : "🧱", `${g.side === "over" ? "Más" : "Menos"} de ${g.line} goles`, g.p);
+
+  // ambos marcan
+  if (m.pBTTS >= 0.5) push("btts", "btts", "⚽", "Ambos marcan", m.pBTTS);
+  else push("btts", "btts", "🚫", "No ambos marcan", 1 - m.pBTTS);
+
+  // el favorito marca / anota 2+
+  const pScore = 1 - Math.exp(-favLam);
+  const p2 = 1 - Math.exp(-favLam) - favLam * Math.exp(-favLam);
+  if (p2 >= 0.52) push("tg", "tg", "🔥", `${favName} anota 2+`, p2);
+  else push("tg", "tg", "⚽", `${favName} marca`, pScore);
+
+  // córners / tarjetas / remates al arco (líneas dinámicas, distintas según el partido)
+  const c = bestLine(m.muCorners, [7.5, 8.5, 9.5, 10.5, 11.5, 12.5], 0.72);
+  push("cor", "cor", "🚩", `${c.side === "over" ? "Más" : "Menos"} de ${c.line} córners`, c.p);
+  const k = bestLine(m.muCards, [2.5, 3.5, 4.5, 5.5], 0.7);
+  push("card", "card", "🟨", `${k.side === "over" ? "Más" : "Menos"} de ${k.line} tarjetas`, k.p);
+  const s = bestLine(m.muSot, [4.5, 5.5, 6.5, 7.5, 8.5, 9.5], 0.72);
+  push("sot", "sot", "🎯", `${s.side === "over" ? "Más" : "Menos"} de ${s.line} remates al arco`, s.p);
+
+  return sel;
+}
+
+// cuota efectiva: usa Betano/Epicbet si la cargaste, si no la cuota justa del modelo
+function makeOddOf(odds) {
+  return (s) => {
+    const b = parseFloat(odds[`${s.mid}:${s.id}:bet`]);
+    const e = parseFloat(odds[`${s.mid}:${s.id}:epic`]);
+    if (b > 1) return { od: b, src: "B" };
+    if (e > 1) return { od: e, src: "E" };
+    return { od: s.fair, src: "" };
+  };
+}
+// bet builder de un solo partido hasta el tramo
+function sameGameCombo(sels, tier, oddOf) {
+  const fams = [...sels].sort((a, b) => b.p - a.p);
   let od = 1, prob = 1; const legs = [];
-  for (const p of fams) { legs.push(p); od *= p.od; prob *= p.p; if (od >= tier) break; }
+  for (const s of fams) { const o = oddOf(s); legs.push({ ...s, od: o.od, src: o.src }); od *= o.od; prob *= s.p; if (od >= tier) break; }
   return { legs, od, prob, reached: od >= tier * 0.92 };
 }
-// combinada del día: mezcla los mejores mercados de los partidos de la fecha (máx 3 por partido)
-function dayCombo(dayMatches, models, tier) {
-  const all = [];
-  dayMatches.forEach((f) => familyPicks(models[f.id], f).forEach((p) => all.push(p)));
-  all.sort((a, b) => b.p - a.p);
+// combinada del día: mezcla mercados de los partidos de la fecha (máx 3 por partido)
+function dayCombo(daySels, tier, oddOf) {
+  const all = [...daySels].sort((a, b) => b.p - a.p);
   const per = {}; let od = 1, prob = 1; const legs = [];
-  for (const p of all) {
-    per[p.mid] = per[p.mid] || 0;
-    if (per[p.mid] >= 3) continue;
-    legs.push(p); per[p.mid]++; od *= p.od; prob *= p.p;
+  for (const s of all) {
+    per[s.mid] = per[s.mid] || 0;
+    if (per[s.mid] >= 3) continue;
+    const o = oddOf(s); legs.push({ ...s, od: o.od, src: o.src }); per[s.mid]++; od *= o.od; prob *= s.p;
     if (od >= tier) break;
   }
   legs.sort((a, b) => a.mid - b.mid || b.p - a.p);
   return { legs, od, prob, reached: od >= tier * 0.92 };
 }
 
-// bola de nieve: 1 pick/día, cuota 1.6-1.9, el más probable
-function snowballPlan(upcoming, models) {
-  const byDay = {};
-  upcoming.forEach((f) => { (byDay[f.date] = byDay[f.date] || []).push(f); });
+// bola de nieve: por día, el ticket más SEGURO (single o doble del mismo partido) con cuota 1.6-1.9
+function snowballPlan(daysSels, oddOf) {
   const plan = [];
-  for (const d of Object.keys(byDay).sort()) {
-    let best = null, near = null;
-    for (const f of byDay[d]) {
-      for (const c of candidates(models[f.id], f)) {
-        const cand = { ...c, f };
-        if (c.od >= 1.6 && c.od <= 1.9) { if (!best || c.p > best.p) best = cand; }
-        if (!near || Math.abs(c.od - 1.75) < Math.abs(near.od - 1.75)) near = cand;
+  for (const { date, sels } of daysSels) {
+    const tickets = [];
+    for (const s of sels) tickets.push({ legs: [{ ...s, od: oddOf(s).od }], od: oddOf(s).od, p: s.p });
+    const byMatch = {};
+    sels.forEach((s) => { (byMatch[s.mid] = byMatch[s.mid] || []).push(s); });
+    for (const mid in byMatch) {
+      const arr = byMatch[mid];
+      for (let i = 0; i < arr.length; i++) for (let j = i + 1; j < arr.length; j++) {
+        if (arr[i].p < 0.6 || arr[j].p < 0.6) continue; // dobles solo con patas seguras
+        const od = oddOf(arr[i]).od * oddOf(arr[j]).od;
+        tickets.push({ legs: [{ ...arr[i], od: oddOf(arr[i]).od }, { ...arr[j], od: oddOf(arr[j]).od }], od, p: arr[i].p * arr[j].p });
       }
     }
-    const pick = best || near;
-    if (pick) plan.push({ date: d, pick });
+    const band = tickets.filter((t) => t.od >= 1.6 && t.od <= 1.9);
+    const pick = band.length
+      ? band.sort((a, b) => b.p - a.p)[0]
+      : tickets.sort((a, b) => Math.abs(a.od - 1.75) - Math.abs(b.od - 1.75))[0];
+    if (pick) plan.push({ date, pick });
   }
   return plan;
 }
@@ -297,6 +327,13 @@ export default function App() {
   const isPlayed = (id) => results[id] && results[id].gh != null;
   const upcoming = FIXTURES.filter((f) => !isPlayed(f.id));
 
+  const selections = useMemo(() => {
+    const o = {};
+    for (const f of FIXTURES) o[f.id] = famSel(models[f.id], f);
+    return o;
+  }, [models]);
+  const oddOf = useMemo(() => makeOddOf(odds), [odds]);
+
   const saveResult = (id, obj) => setResults((p) => ({ ...p, [id]: obj }));
   const clearResult = (id) => setResults((p) => { const n = { ...p }; delete n[id]; return n; });
 
@@ -316,10 +353,10 @@ export default function App() {
             .map(([k, l]) => <button key={k} className={tab === k ? "on" : ""} onClick={() => setTab(k)}>{l}</button>)}
         </nav>
 
-        {tab === "partidos" && <Partidos {...{ models, results, odds, setOdds, open, setOpen, isPlayed }} />}
+        {tab === "partidos" && <Partidos {...{ models, selections, results, odds, setOdds, open, setOpen, isPlayed }} />}
         {tab === "resultados" && <Resultados {...{ results, saveResult, clearResult }} />}
-        {tab === "combinadas" && <Combinadas {...{ upcoming, models }} />}
-        {tab === "nieve" && <Nieve {...{ upcoming, models, snow, setSnow }} />}
+        {tab === "combinadas" && <Combinadas {...{ upcoming, selections, oddOf }} />}
+        {tab === "nieve" && <Nieve {...{ upcoming, selections, oddOf, snow, setSnow }} />}
 
         <div className="disc">
           ⚠️ Probabilidades de un modelo propio (Poisson + Elo dinámico), <b>no</b> garantías. Las cuotas de
@@ -332,7 +369,7 @@ export default function App() {
 }
 
 // ---------- PARTIDOS ----------
-function Partidos({ models, results, odds, setOdds, open, setOpen, isPlayed }) {
+function Partidos({ models, selections, results, odds, setOdds, open, setOpen, isPlayed }) {
   const byDay = useMemo(() => {
     const g = {}; FIXTURES.forEach((f) => { (g[f.date] = g[f.date] || []).push(f); });
     return Object.entries(g).sort((a, b) => a[0].localeCompare(b[0]));
@@ -369,7 +406,7 @@ function Partidos({ models, results, odds, setOdds, open, setOpen, isPlayed }) {
                     </div>
                   )}
                 </div>
-                {open === f.id && <MatchDetail {...{ f, m, odds, setOdds }} />}
+                {open === f.id && <MatchDetail {...{ f, m, sels: selections[f.id], odds, setOdds }} />}
               </div>
             );
           })}
@@ -378,28 +415,29 @@ function Partidos({ models, results, odds, setOdds, open, setOpen, isPlayed }) {
     </div>
   );
 }
-function MatchDetail({ f, m, odds, setOdds }) {
-  const mk = [
-    ["1", `Gana ${es(f.home)}`, m.pHome], ["X", "Empate", m.pDraw], ["2", `Gana ${es(f.away)}`, m.pAway],
-    ["DC1", `${es(f.home)} o empate`, m.pHome + m.pDraw], ["DC2", `Empate o ${es(f.away)}`, m.pAway + m.pDraw],
-    ["O25", "+2.5 goles", m.pOver25], ["U25", "−2.5 goles", m.pUnder25], ["BTTS", "Ambos marcan", m.pBTTS],
-    ["COR", "+9.5 córners", m.pCornersOver], ["CAR", "+3.5 tarjetas", m.pCardsOver], ["SOT", "+7.5 remates al arco", m.pSotOver],
-  ];
-  const key = (a, b) => `${f.id}:${a}:${b}`;
-  const set = (a, b, v) => setOdds((p) => ({ ...p, [key(a, b)]: v }));
+function MatchDetail({ f, m, sels, odds, setOdds }) {
+  const key = (id, b) => `${f.id}:${id}:${b}`;
+  const set = (id, b, v) => setOdds((p) => ({ ...p, [key(id, b)]: v }));
   const edge = (p, raw) => (raw && raw > 1 ? p * raw - 1 : null);
+  const rows = [
+    { id: "1", label: `Gana ${es(f.home)}`, p: m.pHome },
+    { id: "X", label: "Empate", p: m.pDraw },
+    { id: "2", label: `Gana ${es(f.away)}`, p: m.pAway },
+    ...sels.filter((s) => s.id !== "res"),
+    ...sels.filter((s) => s.id === "res"),
+  ];
   return (
     <div className="det fade">
-      <div className="mkthd"><span>Mercado</span><span>Justa</span><span>Betano</span><span>Epicbet</span></div>
-      {mk.map(([id, name, p]) => {
-        const bt = parseFloat(odds[key(id, "bet")]), ep = parseFloat(odds[key(id, "epic")]);
-        const eb = edge(p, bt), ee = edge(p, ep);
+      <div className="mkthd"><span>Mercado (línea más probable)</span><span>Justa</span><span>Betano</span><span>Epicbet</span></div>
+      {rows.map((s) => {
+        const bt = parseFloat(odds[key(s.id, "bet")]), ep = parseFloat(odds[key(s.id, "epic")]);
+        const eb = edge(s.p, bt), ee = edge(s.p, ep);
         return (
-          <div className="mkt" key={id}>
-            <span className="mn">{name} <b className="mp">{Math.round(p * 100)}%</b></span>
-            <span className="mf mono">{fairOdds(p).toFixed(2)}</span>
-            <input className={"mono" + (eb > 0 ? " val" : "")} placeholder="–" value={odds[key(id, "bet")] || ""} onChange={(e) => set(id, "bet", e.target.value)} />
-            <input className={"mono" + (ee > 0 ? " val" : "")} placeholder="–" value={odds[key(id, "epic")] || ""} onChange={(e) => set(id, "epic", e.target.value)} />
+          <div className="mkt" key={s.id}>
+            <span className="mn">{s.emoji ? s.emoji + " " : ""}{s.label} <b className="mp">{Math.round(s.p * 100)}%</b></span>
+            <span className="mf mono">{fairOdds(s.p).toFixed(2)}</span>
+            <input className={"mono" + (eb > 0 ? " val" : "")} placeholder="–" value={odds[key(s.id, "bet")] || ""} onChange={(e) => set(s.id, "bet", e.target.value)} />
+            <input className={"mono" + (ee > 0 ? " val" : "")} placeholder="–" value={odds[key(s.id, "epic")] || ""} onChange={(e) => set(s.id, "epic", e.target.value)} />
           </div>
         );
       })}
@@ -409,7 +447,7 @@ function MatchDetail({ f, m, odds, setOdds }) {
         <span className="e">🟨 {m.muCards.toFixed(1)} tarjetas</span>
         <span className="e">🎯 {m.muSot.toFixed(1)} al arco</span>
       </div>
-      <div className="note">Verde = la casa paga más que la cuota justa → hay <b>valor</b>.</div>
+      <div className="note">Verde = la casa paga más que la cuota justa → hay <b>valor</b>. Lo que cargues acá se usa en las Combinadas y la Bola de nieve.</div>
     </div>
   );
 }
@@ -484,7 +522,7 @@ const str = (v) => (v == null ? "" : String(v));
 
 // ---------- COMBINADAS ----------
 const TIERS = [[1.5, "×1.5"], [2, "×2"], [5, "×5"], [10, "×10"], [100, "×100"]];
-function Combinadas({ upcoming, models }) {
+function Combinadas({ upcoming, selections, oddOf }) {
   const [tier, setTier] = useState(2);
   const [mode, setMode] = useState("dia");
   const byDay = useMemo(() => {
@@ -496,10 +534,11 @@ function Combinadas({ upcoming, models }) {
   const partidoCards = [];
   if (mode === "partido") {
     byDay.forEach(([date, list]) => list.forEach((f) => {
-      const c = sameGameCombo(models[f.id], f, tier);
+      const c = sameGameCombo(selections[f.id], tier, oddOf);
       if (c.reached) partidoCards.push({ f, c, date });
     }));
   }
+  const tag = (l) => (l.src ? <sup className="src">{l.src}</sup> : null);
 
   return (
     <div className="fade">
@@ -517,7 +556,8 @@ function Combinadas({ upcoming, models }) {
       </p>
 
       {mode === "dia" && byDay.map(([date, list]) => {
-        const c = dayCombo(list, models, tier);
+        const daySels = list.flatMap((f) => selections[f.id]);
+        const c = dayCombo(daySels, tier, oddOf);
         return (
           <div className="combo" key={date}>
             <div className="combohd">
@@ -527,7 +567,7 @@ function Combinadas({ upcoming, models }) {
             {c.legs.map((l, i) => (
               <div className="leg" key={i}>
                 <span className="lg-m"><span className="lg-fl">{FLAG[l.home]}{FLAG[l.away]}</span> {es(l.home)}–{es(l.away)}</span>
-                <span className="lg-p">{l.emoji} {l.label} <span className="lg-o mono">{l.od.toFixed(2)}</span></span>
+                <span className="lg-p">{l.emoji} {l.label} <span className="lg-o mono">{l.od.toFixed(2)}{tag(l)}</span></span>
               </div>
             ))}
             <div className="combofo">
@@ -551,7 +591,7 @@ function Combinadas({ upcoming, models }) {
           {c.legs.map((l, i) => (
             <div className="leg" key={i}>
               <span className="lg-m">{l.emoji} {l.label}</span>
-              <span className="lg-o mono">{l.od.toFixed(2)} · {Math.round(l.p * 100)}%</span>
+              <span className="lg-o mono">{l.od.toFixed(2)}{tag(l)} · {Math.round(l.p * 100)}%</span>
             </div>
           ))}
           <div className="combofo">
@@ -561,14 +601,19 @@ function Combinadas({ upcoming, models }) {
         </div>
       ))}
 
-      <div className="note">⚠️ En un mismo partido los mercados están correlacionados: Betano suele pagar algo menos que la cuota justa que ves acá.</div>
+      <div className="note">⚠️ <b>B</b>/<b>E</b> = usando tu cuota de Betano/Epicbet; sin etiqueta = cuota justa del modelo. En un mismo partido los mercados están correlacionados: Betano suele pagar algo menos.</div>
     </div>
   );
 }
 
 // ---------- BOLA DE NIEVE ----------
-function Nieve({ upcoming, models, snow, setSnow }) {
-  const plan = useMemo(() => snowballPlan(upcoming, models), [upcoming, models]);
+function Nieve({ upcoming, selections, oddOf, snow, setSnow }) {
+  const plan = useMemo(() => {
+    const byDay = {};
+    upcoming.forEach((f) => { (byDay[f.date] = byDay[f.date] || []).push(f); });
+    const days = Object.keys(byDay).sort().map((date) => ({ date, sels: byDay[date].flatMap((f) => selections[f.id]) }));
+    return snowballPlan(days, oddOf);
+  }, [upcoming, selections, oddOf]);
   const setDay = (d, v) => setSnow((p) => ({ ...p, dias: { ...p.dias, [d]: p.dias[d] === v ? undefined : v } }));
   const reset = () => setSnow({ banca: 5000, dias: {} });
   let proj = snow.banca;
@@ -582,18 +627,20 @@ function Nieve({ upcoming, models, snow, setSnow }) {
           <button className="btn ghost" onClick={reset}>Reiniciar a 5.000</button>
         </div>
       </div>
-      <p className="sub mb">Un pick por día (cuota 1.6–1.9, el más probable de la jornada). Marca Ganó/Perdió y la banca
-        rueda sola apostándose completa cada día.</p>
+      <p className="sub mb">Un ticket por día (cuota 1.6–1.9, el más seguro): puede ser una sola apuesta o dos del mismo
+        partido. Marca Ganó/Perdió y la banca rueda sola apostándose completa.</p>
       {!plan.length && <div className="empty">🏆 No quedan partidos por jugar.</div>}
       {plan.map(({ date, pick }) => {
         const res = snow.dias[date];
         const stake = proj, ret = stake * pick.od;
         const after = res === "loss" ? 0 : ret;
+        const l0 = pick.legs[0];
         const node = (
           <div className="sn" key={date}>
             <div className="d">{DAY_LABEL(date)}</div>
-            <div className="snpick">{pick.emoji} {FLAG[pick.f.home]}{FLAG[pick.f.away]} {es(pick.f.home)}–{es(pick.f.away)}
-              <span className="o mono">· {pick.label} @ {pick.od.toFixed(2)}</span></div>
+            <div className="snpick">{FLAG[l0.home]}{FLAG[l0.away]} {es(l0.home)}–{es(l0.away)}
+              <span className="o mono">@ {pick.od.toFixed(2)}</span></div>
+            <div className="snlegs">{pick.legs.map((l, i) => <span key={i} className="snleg">{l.emoji} {l.label}</span>)}</div>
             <div className="snproj mono">Apuesta ${Math.round(stake).toLocaleString("es-CL")} → si gana ${Math.round(ret).toLocaleString("es-CL")} · prob ≈ {Math.round(pick.p * 100)}%</div>
             <div className="snbtns">
               <button className={res === "win" ? "won" : "w"} onClick={() => setDay(date, "win")}>✅ Ganó</button>
@@ -606,7 +653,7 @@ function Nieve({ upcoming, models, snow, setSnow }) {
       {plan.length > 0 && (
         <div className="combo" style={{ marginTop: 6 }}>
           <div className="combohd"><div className="tt">🟢 Si todo cae</div><div className="od mono">${Math.round(proj).toLocaleString("es-CL")}</div></div>
-          <div className="note">Banca al dejarla rodar los {plan.length} días del plan asumiendo que cada pick gana. Una sola caída = $0; conviene retirar por tramos.</div>
+          <div className="note">Banca al dejarla rodar los {plan.length} días del plan asumiendo que cada ticket gana. Una sola caída = $0; conviene retirar por tramos.</div>
         </div>
       )}
     </div>
@@ -734,6 +781,9 @@ const CSS = `
 .snpick{font-weight:800;font-size:15px;margin-top:5px;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 .snpick .o{color:var(--cyan);font-weight:700;font-size:13px}
 .snproj{font-size:12px;color:var(--mut);margin-top:6px}
+.snlegs{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}
+.snleg{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:5px 9px;font-size:12.5px;font-weight:700}
+.src{font-size:9px;color:var(--gold);font-weight:800;margin-left:1px;vertical-align:super}
 .snbtns{display:flex;gap:7px;margin-top:9px}
 .snbtns button{flex:1;padding:9px;border-radius:9px;border:1px solid var(--line);background:var(--bg1);color:var(--mut);
   font-family:inherit;font-weight:800;cursor:pointer;font-size:13px}
