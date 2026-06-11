@@ -261,27 +261,22 @@ function dayCombo(daySels, tier, oddOf) {
   return { legs, od, prob, reached: od >= tier * 0.92 };
 }
 
-// bola de nieve: por día, el ticket más SEGURO (single o doble del mismo partido) con cuota 1.6-1.9
-function snowballPlan(daysSels, oddOf) {
+// bola de nieve: el ticket más SEGURO de CADA partido (single o doble del mismo partido) con cuota 1.6-1.9
+function snowballPlan(matches, oddOf) {
   const plan = [];
-  for (const { date, sels } of daysSels) {
+  for (const { f, sels } of matches) {
     const tickets = [];
     for (const s of sels) tickets.push({ legs: [{ ...s, od: oddOf(s).od }], od: oddOf(s).od, p: s.p });
-    const byMatch = {};
-    sels.forEach((s) => { (byMatch[s.mid] = byMatch[s.mid] || []).push(s); });
-    for (const mid in byMatch) {
-      const arr = byMatch[mid];
-      for (let i = 0; i < arr.length; i++) for (let j = i + 1; j < arr.length; j++) {
-        if (arr[i].p < 0.6 || arr[j].p < 0.6) continue; // dobles solo con patas seguras
-        const od = oddOf(arr[i]).od * oddOf(arr[j]).od;
-        tickets.push({ legs: [{ ...arr[i], od: oddOf(arr[i]).od }, { ...arr[j], od: oddOf(arr[j]).od }], od, p: arr[i].p * arr[j].p });
-      }
+    for (let i = 0; i < sels.length; i++) for (let j = i + 1; j < sels.length; j++) {
+      if (sels[i].p < 0.6 || sels[j].p < 0.6) continue; // dobles solo con patas seguras
+      const od = oddOf(sels[i]).od * oddOf(sels[j]).od;
+      tickets.push({ legs: [{ ...sels[i], od: oddOf(sels[i]).od }, { ...sels[j], od: oddOf(sels[j]).od }], od, p: sels[i].p * sels[j].p });
     }
     const band = tickets.filter((t) => t.od >= 1.6 && t.od <= 1.9);
     const pick = band.length
       ? band.sort((a, b) => b.p - a.p)[0]
       : tickets.sort((a, b) => Math.abs(a.od - 1.75) - Math.abs(b.od - 1.75))[0];
-    if (pick) plan.push({ date, pick });
+    if (pick) plan.push({ id: f.id, f, date: f.date, pick });
   }
   return plan;
 }
@@ -609,14 +604,17 @@ function Combinadas({ upcoming, selections, oddOf }) {
 // ---------- BOLA DE NIEVE ----------
 function Nieve({ upcoming, selections, oddOf, snow, setSnow }) {
   const plan = useMemo(() => {
-    const byDay = {};
-    upcoming.forEach((f) => { (byDay[f.date] = byDay[f.date] || []).push(f); });
-    const days = Object.keys(byDay).sort().map((date) => ({ date, sels: byDay[date].flatMap((f) => selections[f.id]) }));
-    return snowballPlan(days, oddOf);
+    const matches = [...upcoming]
+      .sort((a, b) => a.date.localeCompare(b.date) || a.id - b.id)
+      .map((f) => ({ f, sels: selections[f.id] }));
+    return snowballPlan(matches, oddOf);
   }, [upcoming, selections, oddOf]);
-  const setDay = (d, v) => setSnow((p) => ({ ...p, dias: { ...p.dias, [d]: p.dias[d] === v ? undefined : v } }));
+  const setPick = (id, v) => setSnow((p) => ({ ...p, dias: { ...p.dias, [id]: p.dias[id] === v ? undefined : v } }));
   const reset = () => setSnow({ banca: 5000, dias: {} });
-  let proj = snow.banca;
+  const money = (n) => (n >= 1e7
+    ? "$" + new Intl.NumberFormat("es-CL", { notation: "compact", maximumFractionDigits: 1 }).format(n)
+    : "$" + Math.round(n).toLocaleString("es-CL"));
+  let proj = snow.banca, lastDate = null;
   return (
     <div className="fade">
       <div className="bank">
@@ -627,33 +625,35 @@ function Nieve({ upcoming, selections, oddOf, snow, setSnow }) {
           <button className="btn ghost" onClick={reset}>Reiniciar a 5.000</button>
         </div>
       </div>
-      <p className="sub mb">Un ticket por día (cuota 1.6–1.9, el más seguro): puede ser una sola apuesta o dos del mismo
-        partido. Marca Ganó/Perdió y la banca rueda sola apostándose completa.</p>
+      <p className="sub mb">Un ticket por <b>cada partido</b> del Mundial (cuota 1.6–1.9, el más seguro): una sola apuesta
+        o dos del mismo partido. Marca Ganó/Perdió y la banca rueda partido a partido.</p>
       {!plan.length && <div className="empty">🏆 No quedan partidos por jugar.</div>}
-      {plan.map(({ date, pick }) => {
-        const res = snow.dias[date];
+      {plan.map(({ id, f, date, pick }) => {
+        const res = snow.dias[id];
         const stake = proj, ret = stake * pick.od;
         const after = res === "loss" ? 0 : ret;
-        const l0 = pick.legs[0];
+        const showHd = date !== lastDate; lastDate = date;
         const node = (
-          <div className="sn" key={date}>
-            <div className="d">{DAY_LABEL(date)}</div>
-            <div className="snpick">{FLAG[l0.home]}{FLAG[l0.away]} {es(l0.home)}–{es(l0.away)}
-              <span className="o mono">@ {pick.od.toFixed(2)}</span></div>
-            <div className="snlegs">{pick.legs.map((l, i) => <span key={i} className="snleg">{l.emoji} {l.label}</span>)}</div>
-            <div className="snproj mono">Apuesta ${Math.round(stake).toLocaleString("es-CL")} → si gana ${Math.round(ret).toLocaleString("es-CL")} · prob ≈ {Math.round(pick.p * 100)}%</div>
-            <div className="snbtns">
-              <button className={res === "win" ? "won" : "w"} onClick={() => setDay(date, "win")}>✅ Ganó</button>
-              <button className={res === "loss" ? "lost" : "l"} onClick={() => setDay(date, "loss")}>❌ Perdió</button>
+          <React.Fragment key={id}>
+            {showHd && <div className="dayhd snhd"><span className="dot" /><b>{DAY_LABEL(date)}</b><span className="ln" /></div>}
+            <div className="sn">
+              <div className="snpick">{FLAG[f.home]}{FLAG[f.away]} {es(f.home)}–{es(f.away)}
+                <span className="o mono">@ {pick.od.toFixed(2)}</span></div>
+              <div className="snlegs">{pick.legs.map((l, i) => <span key={i} className="snleg">{l.emoji} {l.label}</span>)}</div>
+              <div className="snproj mono">Apuesta {money(stake)} → si gana {money(ret)} · prob ≈ {Math.round(pick.p * 100)}%</div>
+              <div className="snbtns">
+                <button className={res === "win" ? "won" : "w"} onClick={() => setPick(id, "win")}>✅ Ganó</button>
+                <button className={res === "loss" ? "lost" : "l"} onClick={() => setPick(id, "loss")}>❌ Perdió</button>
+              </div>
             </div>
-          </div>
+          </React.Fragment>
         );
         proj = after; return node;
       })}
       {plan.length > 0 && (
-        <div className="combo" style={{ marginTop: 6 }}>
-          <div className="combohd"><div className="tt">🟢 Si todo cae</div><div className="od mono">${Math.round(proj).toLocaleString("es-CL")}</div></div>
-          <div className="note">Banca al dejarla rodar los {plan.length} días del plan asumiendo que cada ticket gana. Una sola caída = $0; conviene retirar por tramos.</div>
+        <div className="combo" style={{ marginTop: 10 }}>
+          <div className="combohd"><div className="tt">🟢 Si todo cae</div><div className="od mono">{money(proj)}</div></div>
+          <div className="note">Banca al dejarla rodar los {plan.length} partidos del plan asumiendo que cada ticket gana. Una sola caída = $0; conviene retirar por tramos.</div>
         </div>
       )}
     </div>
@@ -784,6 +784,7 @@ const CSS = `
 .snlegs{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}
 .snleg{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:5px 9px;font-size:12.5px;font-weight:700}
 .src{font-size:9px;color:var(--gold);font-weight:800;margin-left:1px;vertical-align:super}
+.snhd{margin-top:16px}
 .snbtns{display:flex;gap:7px;margin-top:9px}
 .snbtns button{flex:1;padding:9px;border-radius:9px;border:1px solid var(--line);background:var(--bg1);color:var(--mut);
   font-family:inherit;font-weight:800;cursor:pointer;font-size:13px}
